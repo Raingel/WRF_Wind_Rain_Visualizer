@@ -1,0 +1,16 @@
+name: wrf
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - wgrib2
+  - pip
+  - pip:
+      - requests
+      - pandas
+      - numpy
+      - scipy
+      - matplotlib
+      - geojson
+      - geojsoncontour
+      - python-dateutil
