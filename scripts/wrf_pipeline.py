@@ -8,7 +8,6 @@ import shutil
 import logging
 import subprocess
 from pathlib import Path
-from datetime import datetime
 
 import requests
 import pandas as pd
@@ -32,15 +31,14 @@ WRF_DATALIST = [
 
 MATCH_REGEX = r"TMP:2 m|NSWRS:surface|UGRD:10 m|VGRD:10 m|RH:2 m|APCP:surface"
 
-# Taiwan bbox (跟你原本一致)
+# Taiwan bbox
 LON_MIN, LON_MAX = 119.9, 122.0
 LAT_MIN, LAT_MAX = 21.9, 25.5
 
-# interpolation 網格密度（跟你原本一致）
+# interpolation grids
 APCP_GRID_NX, APCP_GRID_NY = 200, 200
 WIND_GRID_NX, WIND_GRID_NY = 10, 50
 
-# contour levels（跟你原本一致）
 CONTOUR_LEVELS = [0, 1, 2, 6, 10, 15, 20, 30, 40, 50, 70, 90, 110, 130, 150, 200, 300, 9999]
 
 COLORS = [
@@ -100,13 +98,11 @@ def robust_get(session: requests.Session, url: str, timeout=60, retries=5) -> re
 
 
 def extract_grb_uri(meta_json: dict) -> str:
-    # 你原本用的路徑
     try:
         return meta_json["cwaopendata"]["dataset"]["resource"]["uri"]
     except Exception:
         pass
 
-    # 防守性：有些 open data 可能是 resources list
     try:
         res = meta_json["cwaopendata"]["dataset"]["resources"]["resource"]
         if isinstance(res, list) and len(res) > 0:
@@ -137,105 +133,158 @@ def download_grib2_files(api_key: str):
 
 
 def run_wgrib2_to_csv():
-    # wgrib2 由 conda-forge 裝好後，binary 會在 PATH
+    """
+    先用 -match 篩選變數，再用 -small_grib 裁台灣 bbox，
+    這樣後面 Python 讀 CSV 的量會小很多。
+    """
     for ds in WRF_DATALIST:
         grb_path = GRIB_DIR / f"{ds}.grb2"
         if not grb_path.exists():
             logger.warning("Missing GRIB2: %s (skip)", grb_path)
             continue
 
+        sub_grb = GRIB_DIR / f"{ds}.tw.grb2"
         csv_path = CSV_DIR / f"{ds}.csv"
-        logger.info("wgrib2 -> csv: %s", ds)
 
-        cmd = [
+        # 1) 先 match + bbox subset
+        cmd_subset = [
             "wgrib2",
             str(grb_path),
             "-match", MATCH_REGEX,
+            "-set_grib_type", "c3",
+            "-small_grib",
+            f"{LON_MIN}:{LON_MAX}",
+            f"{LAT_MIN}:{LAT_MAX}",
+            str(sub_grb),
+        ]
+        proc = subprocess.run(cmd_subset, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if proc.returncode != 0:
+            logger.error("wgrib2 subset failed: %s\nstderr:\n%s", ds, proc.stderr)
+            raise RuntimeError(f"wgrib2 subset failed for {ds}")
+
+        # 2) 子區域轉 csv（這裡不再 match，因為子檔已經只剩需要的 messages）
+        logger.info("wgrib2 -> csv: %s", ds)
+        cmd_csv = [
+            "wgrib2",
+            str(sub_grb),
             "-csv", str(csv_path)
         ]
-        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        if proc.returncode != 0:
-            logger.error("wgrib2 failed: %s\nstdout:\n%s\nstderr:\n%s", ds, proc.stdout, proc.stderr)
-            raise RuntimeError(f"wgrib2 failed for {ds}")
+        proc2 = subprocess.run(cmd_csv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if proc2.returncode != 0:
+            logger.error("wgrib2 csv failed: %s\nstderr:\n%s", ds, proc2.stderr)
+            raise RuntimeError(f"wgrib2 csv failed for {ds}")
+
+        # 3) 清掉中間檔
+        try:
+            sub_grb.unlink(missing_ok=True)
+            (Path(str(sub_grb) + ".idx")).unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
-def normalize_var_name(s: str) -> str:
-    # "TMP:2 m" -> "TMP"
-    return str(s).split(":")[0].strip()
-
-
-def parse_time_like(x: str):
-    """
-    盡量吃下 wgrib2 常見的時間格式
-    可能有:
-      2026-02-04 00:00:00
-      2026020400
-      d=2026020400
-    """
-    if pd.isna(x):
+def parse_time_like_scalar(x: str):
+    if x is None or (isinstance(x, float) and pd.isna(x)):
         return pd.NaT
-    s = str(x).strip()
-    s = s.replace("d=", "")
-    # 10 digits: YYYYMMDDHH
+    s = str(x).strip().replace("d=", "")
     if re.fullmatch(r"\d{10}", s):
         return pd.to_datetime(s, format="%Y%m%d%H", errors="coerce")
     return pd.to_datetime(s, errors="coerce")
 
 
+def parse_time_like_series(series: pd.Series) -> pd.Series:
+    """
+    向量化解析 wgrib2 的時間欄位：
+    - d=YYYYMMDDHH
+    - YYYYMMDDHH
+    - 其他可被 pandas 解析的格式
+    """
+    s = series.astype(str).str.strip().str.replace("d=", "", regex=False)
+    mask10 = s.str.fullmatch(r"\d{10}")
+
+    out = pd.Series(pd.NaT, index=series.index, dtype="datetime64[ns]")
+    if mask10.any():
+        out.loc[mask10] = pd.to_datetime(s.loc[mask10], format="%Y%m%d%H", errors="coerce")
+    if (~mask10).any():
+        out.loc[~mask10] = pd.to_datetime(s.loc[~mask10], errors="coerce")
+
+    return out
+
+
 def build_latest_wrf_table() -> pd.DataFrame:
+    """
+    優化點：
+    - 只讀必要欄位 usecols=[0,1,2,4,5,6]
+    - dtype 先指定，減少推斷成本與記憶體
+    - Initial 通常整檔相同，只 parse 一次
+    - Valid 用向量化解析
+    - bbox 已在 wgrib2 階段裁掉，這裡不再做 bbox 篩選
+    """
     dfs = []
+    initial_list = []
+
     for ds in WRF_DATALIST:
         csv_path = CSV_DIR / f"{ds}.csv"
         if not csv_path.exists():
             continue
 
         try:
-            df = pd.read_csv(csv_path, header=None)
+            df = pd.read_csv(
+                csv_path,
+                header=None,
+                usecols=[0, 1, 2, 4, 5, 6],
+                dtype={0: "string", 1: "string", 2: "string", 4: "float32", 5: "float32", 6: "float32"},
+            )
         except Exception as e:
             logger.warning("Read csv failed: %s (%s)", csv_path, str(e))
             continue
 
-        # 依照你原始程式的欄位假設：0 Initial, 1 Valid, 2 Var, 4 Lon, 5 Lat, 6 Value
-        # 如果 wgrib2 格式有額外欄位，只要至少到 6 就能用
-        if df.shape[1] < 7:
-            logger.warning("Unexpected csv columns: %s cols=%s (skip)", csv_path, df.shape[1])
+        if df.empty:
             continue
 
-        df = df[[0, 1, 2, 4, 5, 6]].copy()
         df.columns = ["Initial", "Valid", "Var", "Lon", "Lat", "Value"]
 
-        df["Var"] = df["Var"].map(normalize_var_name)
-        df["Lon"] = pd.to_numeric(df["Lon"], errors="coerce")
-        df["Lat"] = pd.to_numeric(df["Lat"], errors="coerce")
-        df["Value"] = pd.to_numeric(df["Value"], errors="coerce")
+        # Initial 只 parse 一次
+        init_val = parse_time_like_scalar(df["Initial"].iloc[0])
+        initial_list.append(init_val)
+        df["Initial"] = init_val
 
-        df["Initial"] = df["Initial"].map(parse_time_like)
-        df["Valid"] = df["Valid"].map(parse_time_like)
+        # Valid 向量化解析
+        df["Valid"] = parse_time_like_series(df["Valid"])
 
-        # Taiwan bbox
-        df = df[
-            (df["Lon"] > LON_MIN) & (df["Lon"] < LON_MAX) &
-            (df["Lat"] > LAT_MIN) & (df["Lat"] < LAT_MAX)
-        ].dropna(subset=["Initial", "Valid", "Lon", "Lat", "Var", "Value"])
+        # Var 向量化 normalize
+        df["Var"] = df["Var"].astype("string").str.split(":", n=1).str[0].str.strip()
+        df["Var"] = df["Var"].astype("category")
+
+        # dropna
+        df = df.dropna(subset=["Initial", "Valid", "Lon", "Lat", "Var", "Value"])
 
         dfs.append(df)
+
+        logger.info("Loaded %s rows=%s", ds, len(df))
 
     if not dfs:
         raise RuntimeError("No CSV data loaded. Check download/wgrib2 steps.")
 
-    all_df = pd.concat(dfs, ignore_index=True)
-    latest_initial = all_df["Initial"].max()
-    latest_df = all_df[all_df["Initial"] == latest_initial].copy()
+    # 先決定 latest initial（不必 concat 全部才能決定）
+    latest_initial = pd.to_datetime(max(initial_list))
+    logger.info("Latest Initial = %s", latest_initial)
 
-    # pivot 到寬表：一列是一個 (Initial, Valid, Lon, Lat)
-    wide = latest_df.pivot_table(
+    # 只保留 latest initial
+    dfs2 = [d[d["Initial"] == latest_initial] for d in dfs]
+    dfs2 = [d for d in dfs2 if not d.empty]
+    if not dfs2:
+        raise RuntimeError("All CSVs filtered out after selecting latest Initial. Unexpected initial mismatch.")
+
+    all_df = pd.concat(dfs2, ignore_index=True)
+
+    # pivot 到寬表
+    wide = all_df.pivot_table(
         index=["Initial", "Valid", "Lon", "Lat"],
         columns="Var",
         values="Value",
         aggfunc="first"
     ).reset_index()
 
-    # 存成 gzip csv，簡單且不需要額外引擎
     wide.to_csv(LATEST_CSV_GZ, index=False, compression="gzip")
     logger.info("Saved latest WRF table: %s (rows=%s)", LATEST_CSV_GZ, len(wide))
 
@@ -288,23 +337,19 @@ def reset_out_dir():
 
 
 def generate_outputs(wide_df: pd.DataFrame):
-    # wide_df 已經是 latest initial
     reset_out_dir()
 
-    # date range json
     vmin = wide_df["Valid"].min()
     vmax = wide_df["Valid"].max()
     with open(DATE_RANGE_JSON, "w", encoding="utf-8") as f:
         json.dump([vmin.strftime("%Y-%m-%d %H:%M:%S"), vmax.strftime("%Y-%m-%d %H:%M:%S")], f)
     logger.info("Saved date range: %s", DATE_RANGE_JSON)
 
-    # 6H steps
     wrf_date_range = pd.date_range(start=vmin, end=vmax, freq="6H").to_list()
 
     def data_extract(df, start, end):
         return df[(df["Valid"] >= start) & (df["Valid"] <= end)]
 
-    # 預先檢查必要欄位
     needed_cols = {"Lon", "Lat", "Valid", "APCP", "VGRD", "UGRD"}
     missing = needed_cols - set(wide_df.columns)
     if missing:
@@ -326,7 +371,6 @@ def generate_outputs(wide_df: pd.DataFrame):
                 wind_path.write_text(json.dumps({}), encoding="utf-8")
                 continue
 
-            # APCP diff
             grp = data_in_span.groupby(["Lon", "Lat"])
             diff = grp.max(numeric_only=True) - grp.min(numeric_only=True)
 
@@ -342,7 +386,6 @@ def generate_outputs(wide_df: pd.DataFrame):
             else:
                 apcp_path.write_text(json.dumps({}), encoding="utf-8")
 
-            # WIND mean
             mean_uv = data_in_span[["Lon", "Lat", "VGRD", "UGRD"]].groupby(["Lon", "Lat"]).mean(numeric_only=True)
             lonlat_list = [list(ele) for ele in mean_uv.index.to_list()]
 
@@ -360,7 +403,7 @@ def generate_outputs(wide_df: pd.DataFrame):
             wv = np.nan_to_num(wv_result)
             wu = np.nan_to_num(wu_result)
 
-            ws = (np.sqrt((wv ** 2) + (wu ** 2)) * 1.94).astype(int)  # m/s -> knots
+            ws = (np.sqrt((wv ** 2) + (wu ** 2)) * 1.94).astype(int)
             wd = ((270 - np.arctan2(wv, wu) * 180 / np.pi) % 360).astype(int)
 
             lon_list = np.round(xx[0], 3).tolist()
