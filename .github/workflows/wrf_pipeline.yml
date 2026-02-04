@@ -3,8 +3,8 @@ name: WRF pipeline
 on:
   workflow_dispatch:
   schedule:
-    # 這是 UTC 時間。例：每 6 小時跑一次，UTC 的 00:15, 06:15, 12:15, 18:15
-    - cron: "15 */6 * * *"
+    # 台灣時間每天 02:00（UTC+8）= UTC 每天 18:00
+    - cron: "0 18 * * *"
 
 permissions:
   contents: write
