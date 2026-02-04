@@ -345,7 +345,7 @@ def generate_outputs(wide_df: pd.DataFrame):
         json.dump([vmin.strftime("%Y-%m-%d %H:%M:%S"), vmax.strftime("%Y-%m-%d %H:%M:%S")], f)
     logger.info("Saved date range: %s", DATE_RANGE_JSON)
 
-    wrf_date_range = pd.date_range(start=vmin, end=vmax, freq="6H").to_list()
+    wrf_date_range = pd.date_range(start=vmin, end=vmax, freq="6h").to_list()
 
     def data_extract(df, start, end):
         return df[(df["Valid"] >= start) & (df["Valid"] <= end)]
